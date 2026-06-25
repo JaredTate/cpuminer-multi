@@ -261,6 +261,7 @@ char *short_url = NULL;
 static unsigned char pk_script[25] = { 0 };
 static size_t pk_script_size = 0;
 static char coinbase_sig[101] = { 0 };
+static bool opt_digidollar = false;
 char *opt_cert;
 char *opt_proxy;
 long opt_proxy_type;
@@ -406,6 +407,7 @@ Options:\n\
   -n, --nfactor         neoscrypt N-Factor\n\
       --coinbase-addr=ADDR  payout address for solo mining\n\
       --coinbase-sig=TEXT  data to insert in the coinbase when possible\n\
+      --digidollar      request DigiDollar oracle GBT rules\n\
       --max-log-rate    limit per-core hashrate logs (default: 5s)\n\
       --no-longpoll     disable long polling support\n\
       --no-getwork      disable getwork support\n\
@@ -460,6 +462,7 @@ static struct option const options[] = {
 	{ "cpu-priority", 1, NULL, 1021 },
 	{ "no-color", 0, NULL, 1002 },
 	{ "debug", 0, NULL, 'D' },
+	{ "digidollar", 0, NULL, 1063 },
 	{ "diff-factor", 1, NULL, 'f' },
 	{ "diff", 1, NULL, 'f' }, // deprecated (alias)
 	{ "diff-multiplier", 1, NULL, 'm' },
@@ -771,13 +774,82 @@ static bool get_mininginfo(CURL *curl, struct work *work)
 
 #define BLOCK_VERSION_CURRENT 3
 
+static bool gbt_decode_hash(unsigned char *hash, const char *hexstr)
+{
+	unsigned char tmp[32];
+	int i;
+
+	if (!hexstr || strlen(hexstr) != 64 || !hex2bin(tmp, hexstr, sizeof(tmp)))
+		return false;
+
+	for (i = 0; i < 32; i++)
+		hash[i] = tmp[31 - i];
+
+	return true;
+}
+
+static bool gbt_tx_ensure_capacity(unsigned char **tx, int *tx_alloc, int need)
+{
+	unsigned char *new_tx;
+	int new_alloc = *tx_alloc ? *tx_alloc : 256;
+
+	if (need <= *tx_alloc)
+		return true;
+
+	while (new_alloc < need)
+		new_alloc *= 2;
+
+	new_tx = (unsigned char*) realloc(*tx, new_alloc);
+	if (!new_tx)
+		return false;
+
+	*tx = new_tx;
+	*tx_alloc = new_alloc;
+	return true;
+}
+
+static bool gbt_append_commitment_output(unsigned char **tx, int *tx_size,
+					 int *tx_alloc, const char *script_hex)
+{
+	unsigned char script[512];
+	unsigned char script_len_vi[9];
+	size_t hex_len;
+	int script_size, script_len_vi_size, need;
+
+	if (!script_hex)
+		return false;
+
+	hex_len = strlen(script_hex);
+	if (hex_len % 2)
+		return false;
+	script_size = (int) (hex_len / 2);
+	if (script_size <= 0 || script_size > (int) sizeof(script))
+		return false;
+	if (!hex2bin(script, script_hex, script_size))
+		return false;
+
+	script_len_vi_size = varint_encode(script_len_vi, script_size);
+	need = *tx_size + 8 + script_len_vi_size + script_size;
+	if (!gbt_tx_ensure_capacity(tx, tx_alloc, need))
+		return false;
+
+	memset(*tx + *tx_size, 0x00, 8);
+	*tx_size += 8;
+	memcpy(*tx + *tx_size, script_len_vi, script_len_vi_size);
+	*tx_size += script_len_vi_size;
+	memcpy(*tx + *tx_size, script, script_size);
+	*tx_size += script_size;
+
+	return true;
+}
+
 static bool gbt_work_decode(const json_t *val, struct work *work)
 {
 	int i, n;
 	uint32_t version, curtime, bits;
 	uint32_t prevhash[8];
 	uint32_t target[8];
-	int cbtx_size;
+	int cbtx_size, cbtx_alloc = 0;
 	uchar *cbtx = NULL;
 	int tx_count, tx_size;
 	uchar txc_vi[9];
@@ -874,7 +946,8 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 	if (tmp) {
 		const char *cbtx_hex = json_string_value(json_object_get(tmp, "data"));
 		cbtx_size = cbtx_hex ? (int) strlen(cbtx_hex) / 2 : 0;
-		cbtx = (uchar*) malloc(cbtx_size + 100);
+		cbtx_alloc = cbtx_size + 100;
+		cbtx = (uchar*) malloc(cbtx_alloc);
 		if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
 			applog(LOG_ERR, "JSON invalid coinbasetxn");
 			goto out;
@@ -895,7 +968,8 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 			goto out;
 		}
 		cbvalue = (int64_t) (json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp));
-		cbtx = (uchar*) malloc(256);
+		cbtx_alloc = 512;
+		cbtx = (uchar*) malloc(cbtx_alloc);
 		le32enc((uint32_t *)cbtx, 1); /* version */
 		cbtx[4] = 1; /* in-counter */
 		memset(cbtx+5, 0x00, 32); /* prev txout hash */
@@ -919,6 +993,8 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		}
 		le32enc((uint32_t *)(cbtx+cbtx_size), 0xffffffff); /* sequence */
 		cbtx_size += 4;
+		int out_count_pos = cbtx_size;
+		int out_count = 1;
 		cbtx[cbtx_size++] = 1; /* out-counter */
 		le32enc((uint32_t *)(cbtx+cbtx_size), (uint32_t)cbvalue); /* value */
 		le32enc((uint32_t *)(cbtx+cbtx_size+4), cbvalue >> 32);
@@ -926,6 +1002,27 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		cbtx[cbtx_size++] = (uint8_t) pk_script_size; /* txout-script length */
 		memcpy(cbtx+cbtx_size, pk_script, pk_script_size);
 		cbtx_size += (int) pk_script_size;
+		tmp = json_object_get(val, "default_witness_commitment");
+		if (tmp && json_is_string(tmp)) {
+			const char *commitment = json_string_value(tmp);
+			if (!gbt_append_commitment_output(&cbtx, &cbtx_size, &cbtx_alloc, commitment)) {
+				applog(LOG_ERR, "JSON invalid default_witness_commitment");
+				goto out;
+			}
+			out_count++;
+		}
+		if (opt_digidollar) {
+			tmp = json_object_get(val, "default_oracle_commitment");
+			if (tmp && json_is_string(tmp)) {
+				const char *commitment = json_string_value(tmp);
+				if (!gbt_append_commitment_output(&cbtx, &cbtx_size, &cbtx_alloc, commitment)) {
+					applog(LOG_ERR, "JSON invalid default_oracle_commitment");
+					goto out;
+				}
+				out_count++;
+			}
+		}
+		cbtx[out_count_pos] = (unsigned char) out_count;
 		le32enc((uint32_t *)(cbtx+cbtx_size), 0); /* lock time */
 		cbtx_size += 4;
 		coinbase_append = true;
@@ -965,6 +1062,11 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 			int push_len = cbtx[41] + xsig_len < 76 ? 1 :
 			               cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
 			n = xsig_len + push_len;
+			if (!gbt_tx_ensure_capacity(&cbtx, &cbtx_alloc, cbtx_size + n)) {
+				applog(LOG_ERR, "Out of memory");
+				goto out;
+			}
+			ssig_end = cbtx + 42 + cbtx[41];
 			memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
 			cbtx[41] += n;
 			if (push_len == 2)
@@ -987,6 +1089,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 	for (i = 0; i < tx_count; i++) {
 		tmp = json_array_get(txa, i);
 		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
+		const char *txid_hex = json_string_value(json_object_get(tmp, "txid"));
 		const int tx_size = tx_hex ? (int) (strlen(tx_hex) / 2) : 0;
 		unsigned char *tx = (uchar*) malloc(tx_size);
 		if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
@@ -994,9 +1097,23 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 			free(tx);
 			goto out;
 		}
-		sha256d(merkle_tree[1 + i], tx, tx_size);
+		if (txid_hex) {
+			if (strlen(txid_hex) != 64) {
+				applog(LOG_ERR, "JSON invalid transaction txid");
+				free(tx);
+				goto out;
+			}
+			if (!gbt_decode_hash(merkle_tree[1 + i], txid_hex)) {
+				applog(LOG_ERR, "JSON invalid transaction txid");
+				free(tx);
+				goto out;
+			}
+		} else {
+			sha256d(merkle_tree[1 + i], tx, tx_size);
+		}
 		if (!submit_coinbase)
 			strcat(work->txs, tx_hex);
+		free(tx);
 	}
 	n = 1 + tx_count;
 	while (n > 1) {
@@ -1390,13 +1507,20 @@ static const char *getwork_req =
 
 #define GBT_CAPABILITIES "[\"coinbasetxn\", \"coinbasevalue\", \"longpoll\", \"workid\"]"
 #define GBT_RULES "[\"segwit\"]"
+#define GBT_DIGIDOLLAR_RULES "[\"segwit\",\"digidollar-oracle\"]"
 
 static const char *gbt_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
 	GBT_CAPABILITIES ", \"rules\": " GBT_RULES "}], \"id\":0}\r\n";
+static const char *gbt_digidollar_req =
+	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+	GBT_CAPABILITIES ", \"rules\": " GBT_DIGIDOLLAR_RULES "}], \"id\":0}\r\n";
 static const char *gbt_lp_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
 	GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+static const char *gbt_digidollar_lp_req =
+	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+	GBT_CAPABILITIES ", \"rules\": " GBT_DIGIDOLLAR_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
 
 static bool get_upstream_work(CURL *curl, struct work *work)
 {
@@ -1414,7 +1538,7 @@ start:
 		val = json_rpc2_call(curl, rpc_url, rpc_userpass, s, NULL, 0);
 	} else {
 		val = json_rpc_call(curl, rpc_url, rpc_userpass,
-		                    have_gbt ? gbt_req : getwork_req,
+		                    have_gbt ? (opt_digidollar ? gbt_digidollar_req : gbt_req) : getwork_req,
 		                    &err, have_gbt ? JSON_RPC_QUIET_404 : 0);
 	}
 	gettimeofday(&tv_end, NULL);
@@ -2630,8 +2754,9 @@ start:
 			val = json_rpc2_call(curl, rpc_url, rpc_userpass, s, &err, JSON_RPC_LONGPOLL);
 		} else {
 			if (have_gbt) {
-				req = (char*) malloc(strlen(gbt_lp_req) + strlen(lp_id) + 1);
-				sprintf(req, gbt_lp_req, lp_id);
+				const char *req_fmt = opt_digidollar ? gbt_digidollar_lp_req : gbt_lp_req;
+				req = (char*) malloc(strlen(req_fmt) + strlen(lp_id) + 1);
+				sprintf(req, req_fmt, lp_id);
 			}
 			val = json_rpc_call(curl, rpc_url, rpc_userpass, getwork_req, &err, JSON_RPC_LONGPOLL);
 			val = json_rpc_call(curl, lp_url, rpc_userpass,
@@ -3243,6 +3368,9 @@ void parse_arg(int key, char *arg)
 	case 1006:
 		print_hash_tests();
 		exit(0);
+	case 1063:
+		opt_digidollar = true;
+		break;
 	case 1007:
 		want_stratum = false;
 		opt_extranonce = false;
