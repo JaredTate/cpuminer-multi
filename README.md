@@ -182,7 +182,52 @@ Run `cpuminer --help` to see options.
 ### DigiByte DigiDollar solo mining
 
 This fork adds an explicit DigiDollar-aware getblocktemplate mode for DigiByte
-solo mining:
+solo mining.
+
+For the current DigiByte algo set, this cpuminer build can mine four of the
+five algos:
+
+* `scrypt`
+* `sha256d`
+* `skein`
+* `qubit`
+
+It does not implement DigiByte `odo` / Odocrypt. The older generic `groestl`
+algo is available in cpuminer, but it is not a replacement for Odocrypt after
+the DigiByte Odo fork. Use an Odo-capable miner or pool stack for Odo blocks.
+
+#### Build on Debian/Ubuntu
+
+```
+sudo apt-get update
+sudo apt-get install -y automake autoconf pkg-config libcurl4-openssl-dev \
+  libjansson-dev libssl-dev libgmp-dev zlib1g-dev make gcc g++
+
+./autogen.sh
+./configure CFLAGS="-O2 -march=native" --with-crypto --with-curl
+make -j"$(nproc)"
+./cpuminer --help | grep digidollar
+```
+
+`./build.sh` is also available for the standard upstream build path, but the
+commands above show every dependency and build step explicitly.
+
+#### DigiDollar readiness check
+
+The DigiByte node serving GBT must already have a completed MuSig2 oracle
+bundle in memory before a mint/redeem block can be mined. Check that directly:
+
+```
+digibyte-cli getblocktemplate '{"rules":["segwit","digidollar-oracle"]}' scrypt
+```
+
+The returned template should contain `default_oracle_commitment` when the next
+block is ready to carry oracle-priced DigiDollar work. If it does not, cpuminer
+can still mine a normal DigiByte block, but that block will not carry a new
+oracle bundle or confirm mint/redeem transactions that require a fresh oracle
+price.
+
+#### Start one DigiDollar-aware miner
 
 ```
 ./cpuminer \
@@ -196,6 +241,54 @@ solo mining:
   --digidollar \
   --threads=6
 ```
+
+#### Start four DigiByte algos
+
+Run one process per algo. Point each process at the DigiByte node/RPC port you
+want to assemble templates for that algo. Replace the payout addresses,
+RPC user, RPC password, and ports with your own values.
+
+```
+RPC_USER=preminer
+RPC_PASS=preminerpass
+THREADS=6
+mkdir -p logs
+
+./cpuminer -a scrypt \
+  -o http://127.0.0.1:14046/ \
+  -O "$RPC_USER:$RPC_PASS" \
+  --coinbase-addr=<SCRYPT_PAYOUT_ADDRESS> \
+  --no-stratum --no-getwork --no-longpoll \
+  --digidollar --threads="$THREADS" \
+  > logs/cpuminer-scrypt.log 2>&1 &
+
+./cpuminer -a sha256d \
+  -o http://127.0.0.1:14047/ \
+  -O "$RPC_USER:$RPC_PASS" \
+  --coinbase-addr=<SHA256D_PAYOUT_ADDRESS> \
+  --no-stratum --no-getwork --no-longpoll \
+  --digidollar --threads="$THREADS" \
+  > logs/cpuminer-sha256d.log 2>&1 &
+
+./cpuminer -a skein \
+  -o http://127.0.0.1:14048/ \
+  -O "$RPC_USER:$RPC_PASS" \
+  --coinbase-addr=<SKEIN_PAYOUT_ADDRESS> \
+  --no-stratum --no-getwork --no-longpoll \
+  --digidollar --threads="$THREADS" \
+  > logs/cpuminer-skein.log 2>&1 &
+
+./cpuminer -a qubit \
+  -o http://127.0.0.1:14049/ \
+  -O "$RPC_USER:$RPC_PASS" \
+  --coinbase-addr=<QUBIT_PAYOUT_ADDRESS> \
+  --no-stratum --no-getwork --no-longpoll \
+  --digidollar --threads="$THREADS" \
+  > logs/cpuminer-qubit.log 2>&1 &
+```
+
+Each command must include `--digidollar` if the miner is expected to include
+DigiDollar mint/redeem transactions after DigiDollar activation.
 
 What `--digidollar` does:
 
@@ -215,19 +308,6 @@ What `--digidollar` does not do:
 Normal mining without `--digidollar` still uses legacy-safe GBT rules
 `["segwit"]`. That path can mine normal DigiByte blocks, but it is not expected
 to mine DigiDollar mint/redeem templates after DigiDollar activation.
-
-For DigiDollar mint/redeem mining to work, the DigiByte node serving
-`getblocktemplate` must already have a completed MuSig2 oracle bundle in memory.
-The quick operator check is:
-
-```
-digibyte-cli getblocktemplate '{"rules":["segwit","digidollar-oracle"]}' scrypt
-```
-
-The returned template should contain `default_oracle_commitment` when the next
-block is ready to carry oracle-priced DigiDollar work. If it does not, cpuminer
-can still mine a normal block, but that block will not carry a new oracle bundle
-or confirm mint/redeem transactions that require a fresh oracle price.
 
 This fork also fixes two GBT correctness issues needed for modern DigiByte
 templates:

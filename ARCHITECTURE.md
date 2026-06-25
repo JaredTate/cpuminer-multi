@@ -102,6 +102,8 @@ Notable files:
 DigiDollar mint/redeem blocks require an oracle commitment in the coinbase when
 the node provides one. This miner handles that without changing legacy behavior:
 
+- The DigiByte/DigiDollar solo path in this fork covers `scrypt`, `sha256d`,
+  `skein`, and `qubit`. It does not implement DigiByte `odo` / Odocrypt.
 - Default GBT requests still advertise only `["segwit"]`.
 - `--digidollar` changes normal and longpoll GBT requests to
   `["segwit","digidollar-oracle"]`.
