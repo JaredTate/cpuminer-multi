@@ -7,6 +7,11 @@ The miner supports two upstream work models:
 - JSON-RPC getwork/getblocktemplate style polling/longpoll
 - Stratum (including JSON-RPC 2.0/XMR style login/job flow)
 
+For DigiByte/DigiDollar solo mining, the relevant path is JSON-RPC
+`getblocktemplate`. This fork keeps normal GBT requests legacy-safe by default
+and only requests DigiDollar oracle-aware templates when the operator passes
+`--digidollar`.
+
 Core design choices favor portability and broad algorithm support over tight abstraction: algorithm dispatch is largely explicit switch-based routing in the mining loop, while transport and parsing are centralized in shared helpers.
 
 ## System Overview
@@ -93,7 +98,39 @@ Notable files:
   - queue primitives (`tq_*`) for inter-thread communication
   - logging helpers + hash diagnostics
 
-### 3) Mining Algorithm Implementations (`algo/`)
+### 3) DigiDollar GBT Handling (`cpu-miner.c`)
+DigiDollar mint/redeem blocks require an oracle commitment in the coinbase when
+the node provides one. This miner handles that without changing legacy behavior:
+
+- Default GBT requests still advertise only `["segwit"]`.
+- `--digidollar` changes normal and longpoll GBT requests to
+  `["segwit","digidollar-oracle"]`.
+- When a DD-aware template contains `default_oracle_commitment`, the miner adds
+  it as a zero-value coinbase output while still building its own payout
+  coinbase.
+- If no `default_oracle_commitment` is present, the miner continues mining a
+  normal DigiByte block. `--digidollar` does not make the miner an oracle and
+  does not create oracle bundles by itself.
+- Existing BIP22 `coinbasetxn` handling remains supported for templates that
+  provide a complete coinbase transaction.
+
+The GBT merkle code is intentionally txid-first:
+
+- For non-coinbase template transactions, use the template `txid` field for the
+  merkle leaf when it is present.
+- Fall back to hashing raw transaction `data` only when no `txid` is supplied.
+- Keep raw transaction `data` in the submitted block payload.
+
+This matters because segwit transactions can include witness bytes in `data`,
+while the block merkle tree commits to txids. Hashing raw witness-inclusive
+transaction bytes would produce the wrong merkle root and can make an otherwise
+valid block fail with `bad-txnmrklroot`.
+
+The miner also encodes the BIP34 height in the generated coinbase script using
+minimal CScript-style integer encoding. That keeps miner-built coinbases
+compatible with modern DigiByte consensus rules.
+
+### 4) Mining Algorithm Implementations (`algo/`)
 - Each file typically exposes one or more `scanhash_*` and/or hash primitives.
 - Families include:
   - SHA/Blake family: sha256d, blake/blakecoin/blake2*, decred, sia
@@ -101,12 +138,12 @@ Notable files:
   - Memory-hard variants: scrypt, scrypt-jane, neoscrypt, yescrypt(+r8/r16/r32), cryptonight/light
   - Composite/chain algos: timetravel, bitcore, tribus, quark/qubit, lyra2* etc.
 
-### 4) Crypto Primitives and Support Libraries
+### 5) Crypto Primitives and Support Libraries
 - `crypto/` – primitive hashes and compression functions.
 - `sha3/`, `lyra2/`, `scryptjane/`, `yescrypt/` – specialized algorithm backends.
 - `asm/` – optimized kernels (AES/SHA/scrypt/neoscrypt) for specific architectures.
 
-### 5) External/API Surface (`api.c`, `api/*.php`)
+### 6) External/API Surface (`api.c`, `api/*.php`)
 - Local API server exposes summary and per-thread stats.
 - Optional remote actions (`seturl`, `quit`) gated by API remote policy/IP ACL.
 - Supports plain TCP command protocol and WebSocket handshake framing.

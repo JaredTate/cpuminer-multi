@@ -179,6 +179,64 @@ Usage instructions
 ==================
 Run `cpuminer --help` to see options.
 
+### DigiByte DigiDollar solo mining
+
+This fork adds an explicit DigiDollar-aware getblocktemplate mode for DigiByte
+solo mining:
+
+```
+./cpuminer \
+  -a qubit \
+  -o http://127.0.0.1:14049/ \
+  -O preminer:preminerpass \
+  --coinbase-addr=DPYbJFnpxBut4gASB8ya9RzYosiYB3Bn4K \
+  --no-stratum \
+  --no-getwork \
+  --no-longpoll \
+  --digidollar \
+  --threads=6
+```
+
+What `--digidollar` does:
+
+* Requests GBT rules `["segwit","digidollar-oracle"]` from the DigiByte node.
+* Preserves `default_oracle_commitment` as a zero-value coinbase output when
+  the node provides one.
+* Allows the node to include DigiDollar mint/redeem transactions in templates
+  when an oracle bundle is ready.
+
+What `--digidollar` does not do:
+
+* It does not turn cpuminer into an oracle.
+* It does not create MuSig2 oracle bundles locally.
+* It does not force mint/redeem transactions into a block if the node did not
+  provide a valid oracle commitment.
+
+Normal mining without `--digidollar` still uses legacy-safe GBT rules
+`["segwit"]`. That path can mine normal DigiByte blocks, but it is not expected
+to mine DigiDollar mint/redeem templates after DigiDollar activation.
+
+For DigiDollar mint/redeem mining to work, the DigiByte node serving
+`getblocktemplate` must already have a completed MuSig2 oracle bundle in memory.
+The quick operator check is:
+
+```
+digibyte-cli getblocktemplate '{"rules":["segwit","digidollar-oracle"]}' scrypt
+```
+
+The returned template should contain `default_oracle_commitment` when the next
+block is ready to carry oracle-priced DigiDollar work. If it does not, cpuminer
+can still mine a normal block, but that block will not carry a new oracle bundle
+or confirm mint/redeem transactions that require a fresh oracle price.
+
+This fork also fixes two GBT correctness issues needed for modern DigiByte
+templates:
+
+* Miner-built BIP34 coinbases now use minimal script-number encoding for the
+  block height.
+* GBT merkle leaves use transaction `txid` when provided. Raw transaction
+  `data` may include witness bytes, but the block merkle root must use txids.
+
 ### Connecting through a proxy
 
 Use the `--proxy` option.
